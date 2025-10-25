@@ -1,0 +1,12 @@
+
+
+Please tell me one of the following options:
+
+1. 📂 You have a dataset file — If yes, please upload the Zomato dataset (CSV, Excel, etc.) here.
+
+I’ll read it, analyze key insights (ratings, cuisines, locations, etc.), and create clear visualizations (bar charts, pie charts, heatmaps, etc.).
+
+
+
+2. 📊 You don’t have a file — I can use a sample Zomato dataset and show you how to analyze and visualize it using Python (with libraries like pandas, matplotlib, and seaborn).
+
