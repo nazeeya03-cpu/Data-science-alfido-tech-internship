@@ -1,0 +1,357 @@
+"""
+Loan approval prediction — end-to-end script
+
+How to use
+1. Put your dataset CSV in the same folder and name it `loan_data.csv` or change the `DATA_PATH` variable.
+2. The script assumes a column named `Loan_Status` (values 'Y'/'N' or 1/0) as the target. Adjust TARGET variable if needed.
+3. Run with Python 3.9+ and install dependencies:
+   pip install pandas numpy scikit-learn matplotlib seaborn xgboost shap joblib
+
+What this script does
+- Loads data
+- Basic EDA and visualizations
+- Preprocessing (missing values, encoding, scaling)
+- Feature engineering suggestions
+- Trains LogisticRegression, RandomForest, and XGBoost
+- Hyperparameter tuning (RandomizedSearchCV)
+- Evaluates models (accuracy, precision, recall, f1, ROC AUC, confusion matrix)
+- Shows feature importances and SHAP explanation for the best model
+- Saves trained best model as `best_model.joblib`
+
+Note: Tweak preprocessing sections to match your real dataset schema.
+"""
+
+import warnings
+warnings.filterwarnings('ignore')
+
+import os
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from sklearn.model_selection import train_test_split, StratifiedKFold, RandomizedSearchCV
+from sklearn.preprocessing import StandardScaler, OrdinalEncoder, OneHotEncoder
+from sklearn.impute import SimpleImputer
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import (accuracy_score, precision_score, recall_score, f1_score,
+                             roc_auc_score, confusion_matrix, classification_report)
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+import xgboost as xgb
+import joblib
+
+# -----------------
+# Configuration
+# -----------------
+DATA_PATH = 'loan_data.csv'  # change if your file has different name
+TARGET = 'Loan_Status'       # change if different
+RANDOM_STATE = 42
+TEST_SIZE = 0.2
+
+# -----------------
+# Load data
+# -----------------
+if not os.path.exists(DATA_PATH):
+    raise FileNotFoundError(f"Can't find {DATA_PATH}. Place your CSV in this folder or update DATA_PATH.")
+
+df = pd.read_csv(DATA_PATH)
+print('\nData sample:')
+print(df.head())
+
+# -----------------
+# Quick EDA
+# -----------------
+print('\nData shape:', df.shape)
+print('\nColumns and dtypes:')
+print(df.dtypes)
+
+print('\nMissing values per column:')
+print(df.isna().sum())
+
+# Target value checks
+print(f"\nTarget unique values ({TARGET}):", df[TARGET].unique())
+
+# If target is 'Y'/'N', map to 1/0
+if df[TARGET].dtype == object:
+    if set(df[TARGET].dropna().unique()) <= set(['Y','N']):
+        df[TARGET] = df[TARGET].map({'Y':1,'N':0})
+        print('\nMapped Loan_Status Y/N to 1/0')
+    elif set(df[TARGET].dropna().unique()) <= set(['y','n']):
+        df[TARGET] = df[TARGET].map({'y':1,'n':0})
+
+# Basic target distribution
+print('\nTarget distribution:')
+print(df[TARGET].value_counts(normalize=True))
+
+# Visualizations: univariate for numeric, barplots for categorical
+numeric_cols = df.select_dtypes(include=['int64','float64']).columns.tolist()
+if TARGET in numeric_cols:
+    numeric_cols.remove(TARGET)
+categorical_cols = df.select_dtypes(include=['object','category']).columns.tolist()
+
+print('\nNumeric cols:', numeric_cols)
+print('\nCategorical cols:', categorical_cols)
+
+# Plot distributions (save figures locally)
+os.makedirs('figures', exist_ok=True)
+for c in numeric_cols:
+    plt.figure(figsize=(6,3))
+    sns.histplot(df[c].dropna(), kde=True)
+    plt.title(f'Distribution: {c}')
+    plt.tight_layout()
+    plt.savefig(f'figures/dist_{c}.png')
+    plt.close()
+
+for c in categorical_cols:
+    plt.figure(figsize=(6,3))
+    sns.countplot(y=c, data=df)
+    plt.title(f'Counts: {c}')
+    plt.tight_layout()
+    plt.savefig(f'figures/count_{c}.png')
+    plt.close()
+
+print('\nSaved univariate plots to ./figures/')
+
+# -----------------
+# Preprocessing choices (COMMON for loan datasets)
+# -----------------
+# Example expected columns (update if your dataset differs):
+expected_columns = ['Gender','Married','Dependents','Education','Self_Employed',
+                    'ApplicantIncome','CoapplicantIncome','LoanAmount','Loan_Amount_Term',
+                    'Credit_History','Property_Area']
+
+# If columns are missing, we proceed with whatever is present.
+cols_present = [c for c in expected_columns if c in df.columns]
+print('\nUsing columns for modeling:', cols_present)
+
+# Feature engineering
+# Create TotalIncome if appropriate
+if 'ApplicantIncome' in df.columns and 'CoapplicantIncome' in df.columns and 'TotalIncome' not in df.columns:
+    df['TotalIncome'] = df['ApplicantIncome'].fillna(0) + df['CoapplicantIncome'].fillna(0)
+    numeric_cols.append('TotalIncome')
+    print('\nCreated TotalIncome feature')
+
+# Log transform skewed numeric features (copy, won't overwrite original)
+skew_candidates = []
+for c in ['LoanAmount','ApplicantIncome','CoapplicantIncome','TotalIncome']:
+    if c in df.columns:
+        skew_candidates.append(c)
+
+for c in skew_candidates:
+    df[c+'_log'] = np.log1p(df[c].fillna(0))
+    numeric_cols.append(c+'_log')
+
+# -----------------
+# Prepare X, y
+# -----------------
+features = [c for c in df.columns if c != TARGET]
+# drop identifiers if any
+for idcol in ['Loan_ID','ID','Id','id']:
+    if idcol in features:
+        features.remove(idcol)
+
+X = df[features].copy()
+y = df[TARGET].copy()
+
+# Split
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=TEST_SIZE,
+                                                    stratify=y, random_state=RANDOM_STATE)
+print('\nTrain size:', X_train.shape)
+print('Test size:', X_test.shape)
+
+# -----------------
+# Build preprocessing pipeline
+# -----------------
+# Identify column types in X_train
+num_cols = X_train.select_dtypes(include=['int64','float64']).columns.tolist()
+cat_cols = X_train.select_dtypes(include=['object','category']).columns.tolist()
+
+print('\nDetected numeric cols:', num_cols)
+print('Detected categorical cols:', cat_cols)
+
+# Simple imputers
+numeric_transformer = Pipeline(steps=[
+    ('imputer', SimpleImputer(strategy='median')),
+    ('scaler', StandardScaler())
+])
+
+categorical_transformer = Pipeline(steps=[
+    ('imputer', SimpleImputer(strategy='most_frequent')),
+    ('onehot', OneHotEncoder(handle_unknown='ignore'))
+])
+
+preprocessor = ColumnTransformer(
+    transformers=[
+        ('num', numeric_transformer, num_cols),
+        ('cat', categorical_transformer, cat_cols)
+    ],
+    remainder='drop'
+)
+
+# -----------------
+# Models to try
+# -----------------
+models = {
+    'logreg': LogisticRegression(max_iter=200, random_state=RANDOM_STATE),
+    'rf': RandomForestClassifier(n_estimators=200, random_state=RANDOM_STATE),
+    'xgb': xgb.XGBClassifier(use_label_encoder=False, eval_metric='logloss', random_state=RANDOM_STATE)
+}
+
+# Pipelines
+pipelines = {name: Pipeline(steps=[('pre', preprocessor), ('clf', model)]) for name, model in models.items()}
+
+# Fit baseline models
+fitted = {}
+for name, pipe in pipelines.items():
+    print(f'\nTraining baseline {name}...')
+    pipe.fit(X_train, y_train)
+    fitted[name] = pipe
+    preds = pipe.predict(X_test)
+    proba = pipe.predict_proba(X_test)[:,1]
+    print(name, 'accuracy:', accuracy_score(y_test, preds))
+    print(classification_report(y_test, preds))
+    print('ROC AUC:', roc_auc_score(y_test, proba))
+
+# -----------------
+# Hyperparameter tuning for the random forest and xgboost
+# -----------------
+param_dist = {
+    'rf': {
+        'clf__n_estimators': [100,200,500],
+        'clf__max_depth': [None, 6, 10, 20],
+        'clf__min_samples_split': [2,5,10],
+        'clf__min_samples_leaf': [1,2,4]
+    },
+    'xgb': {
+        'clf__n_estimators': [100,200,500],
+        'clf__max_depth': [3,5,7,10],
+        'clf__learning_rate': [0.01,0.05,0.1,0.2],
+        'clf__subsample': [0.6,0.8,1.0]
+    }
+}
+
+best_models = {}
+for name in ['rf','xgb']:
+    print(f'\nRunning RandomizedSearchCV for {name} ...')
+    rs = RandomizedSearchCV(pipelines[name], param_distributions=param_dist[name],
+                            n_iter=20, cv=StratifiedKFold(n_splits=4, shuffle=True, random_state=RANDOM_STATE),
+                            scoring='roc_auc', n_jobs=-1, random_state=RANDOM_STATE, verbose=1)
+    rs.fit(X_train, y_train)
+    print('Best params for', name, rs.best_params_)
+    best_models[name] = rs.best_estimator_
+
+# Compare models on test set
+candidates = {'logreg': fitted['logreg'], 'rf': best_models.get('rf', fitted['rf']), 'xgb': best_models.get('xgb', fitted['xgb'])}
+results = []
+for name, model in candidates.items():
+    preds = model.predict(X_test)
+    proba = model.predict_proba(X_test)[:,1]
+    res = {
+        'model': name,
+        'accuracy': accuracy_score(y_test, preds),
+        'precision': precision_score(y_test, preds, zero_division=0),
+        'recall': recall_score(y_test, preds, zero_division=0),
+        'f1': f1_score(y_test, preds, zero_division=0),
+        'roc_auc': roc_auc_score(y_test, proba)
+    }
+    results.append(res)
+
+res_df = pd.DataFrame(results).sort_values('roc_auc', ascending=False)
+print('\nModel comparison on test set:')
+print(res_df)
+
+best_name = res_df.iloc[0]['model']
+best_model = candidates[best_name]
+print(f"\nSelected best model: {best_name}")
+
+# Save model
+joblib.dump(best_model, 'best_model.joblib')
+print('\nSaved best model to best_model.joblib')
+
+# -----------------
+# Confusion matrix and ROC curve for best model
+# -----------------
+from sklearn.metrics import roc_curve, auc
+
+y_pred = best_model.predict(X_test)
+y_proba = best_model.predict_proba(X_test)[:,1]
+
+cm = confusion_matrix(y_test, y_pred)
+plt.figure(figsize=(5,4))
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues')
+plt.xlabel('Predicted')
+plt.ylabel('Actual')
+plt.title('Confusion Matrix')
+plt.tight_layout()
+plt.savefig('figures/confusion_matrix.png')
+plt.close()
+
+fpr, tpr, _ = roc_curve(y_test, y_proba)
+roc_auc = auc(fpr, tpr)
+plt.figure(figsize=(5,4))
+plt.plot(fpr, tpr)
+plt.plot([0,1],[0,1],'--')
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title(f'ROC curve (AUC = {roc_auc:.3f})')
+plt.tight_layout()
+plt.savefig('figures/roc_curve.png')
+plt.close()
+print('\nSaved confusion matrix and ROC curve to ./figures/')
+
+# -----------------
+# Feature importance and SHAP explanation (if tree-based)
+# -----------------
+if best_name in ['rf','xgb']:
+    # Need to extract feature names after preprocessing
+    # Create a preprocessing-only pipeline to get column names
+    pre = preprocessor.fit(X_train)
+    # numeric names
+    num_features = num_cols
+    # onehot feature names
+    try:
+        ohe = pre.named_transformers_['cat'].named_steps['onehot']
+        ohe_feature_names = ohe.get_feature_names_out(cat_cols).tolist()
+    except Exception:
+        ohe_feature_names = cat_cols
+    feature_names = list(num_features) + list(ohe_feature_names)
+
+    # If pipeline ends with clf and is a sklearn wrapper with feature_importances_
+    clf = best_model.named_steps['clf'] if isinstance(best_model, Pipeline) else best_model
+    try:
+        importances = clf.feature_importances_
+        fi = pd.Series(importances, index=feature_names).sort_values(ascending=False)[:20]
+        plt.figure(figsize=(6,4))
+        sns.barplot(x=fi.values, y=fi.index)
+        plt.title('Top feature importances')
+        plt.tight_layout()
+        plt.savefig('figures/feature_importances.png')
+        plt.close()
+        print('\nSaved feature importances to ./figures/feature_importances.png')
+    except Exception:
+        print('\nFeature importances not available for this model.')
+
+    # SHAP (explain on a sample to keep speed reasonable)
+    try:
+        import shap
+        print('\nComputing SHAP values (this may take a moment)...')
+        # get transformed X_test
+        X_test_trans = pre.transform(X_test)
+        # use a small sample
+        sample = X_test_trans[np.random.choice(X_test_trans.shape[0], min(200, X_test_trans.shape[0]), replace=False)]
+        explainer = shap.TreeExplainer(clf)
+        shap_values = explainer.shap_values(sample)
+        # Save a summary plot
+        shap.summary_plot(shap_values, features=sample, feature_names=feature_names, show=False)
+        plt.tight_layout()
+        plt.savefig('figures/shap_summary.png')
+        plt.close()
+        print('\nSaved SHAP summary to ./figures/shap_summary.png')
+    except Exception as e:
+        print('Could not compute SHAP:', str(e))
+
+print('\nAll done. Check the generated figures in ./figures and the saved model best_model.joblib')
+
+
